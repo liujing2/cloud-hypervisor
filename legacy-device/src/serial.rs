@@ -10,7 +10,8 @@ use std::{io, result};
 
 use vmm_sys_util::{EventFd, Result};
 
-use BusDevice;
+use vm_device::device::{IoResource, IrqResource, IoType, Device};
+use vm_memory::{GuestAddress};
 
 const LOOP_SIZE: usize = 0x40;
 
@@ -190,8 +191,17 @@ impl Serial {
     }
 }
 
-impl BusDevice for Serial {
-    fn read(&mut self, offset: u64, data: &mut [u8]) {
+impl Device for Serial {
+    fn name(&self) -> String {
+        "Serial".to_string().clone()
+    }
+
+    fn set_resources(&mut self, _res: &[IoResource], _irq: Option<IrqResource>) {
+
+    }
+    fn read(&mut self, addr: GuestAddress, data: &mut [u8], _io_type: IoType) {
+        let offset = addr.0 - 0x3f8;
+
         if data.len() != 1 {
             return;
         }
@@ -221,7 +231,9 @@ impl BusDevice for Serial {
         };
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) {
+    fn write(&mut self, addr: GuestAddress, data: &[u8], _io_type: IoType) {
+        let offset = addr.0 - 0x3f8;
+
         if data.len() != 1 {
             return;
         }

@@ -1,5 +1,5 @@
 [package]
-name = "devices"
+name = "legacy-device"
 version = "0.1.0"
 authors = ["The Chromium OS Authors"]
 
@@ -7,6 +7,7 @@ authors = ["The Chromium OS Authors"]
 byteorder = ">=1.2.1"
 epoll = "=4.0.1"
 libc = ">=0.2.39"
+vm-device = { path = "../vm-device" }
 vm-memory = { git = "https://github.com/rust-vmm/vm-memory" }
 vmm-sys-util = { git = "https://github.com/liujing2/vmm-sys-util" }
 

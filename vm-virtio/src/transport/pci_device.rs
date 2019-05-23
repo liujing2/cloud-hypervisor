@@ -6,9 +6,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
-extern crate devices;
 extern crate pci;
 extern crate vm_allocator;
+extern crate vm_device;
 extern crate vm_memory;
 extern crate vmm_sys_util;
 
@@ -17,12 +17,12 @@ use libc::EFD_NONBLOCK;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use devices::BusDevice;
 use pci::{
     PciBarConfiguration, PciCapability, PciCapabilityID, PciClassCode, PciConfiguration, PciDevice,
     PciDeviceError, PciHeaderType, PciInterruptPin, PciSubclass,
 };
 use vm_allocator::SystemAllocator;
+use vm_device::device::{Device, IoType, IrqResource, IoResource};
 use vm_memory::{Address, ByteValued, GuestAddress, GuestMemoryMmap, GuestUsize, Le32};
 use vmm_sys_util::{EventFd, Result};
 
@@ -151,6 +151,12 @@ const VIRTIO_PCI_VENDOR_ID: u16 = 0x1af4;
 const VIRTIO_PCI_DEVICE_ID_BASE: u16 = 0x1040; // Add to device type to get device ID.
 
 pub struct VirtioPciDevice {
+    // virtio device name
+    name: String,
+
+    // base address for resolving BARs
+    bar_base_addr: u64,
+
     // PCI configuration registers.
     configuration: PciConfiguration,
 
@@ -164,6 +170,7 @@ pub struct VirtioPciDevice {
     // PCI interrupts.
     interrupt_status: Arc<AtomicUsize>,
     interrupt_evt: Option<EventFd>,
+    irq_num: u32,
 
     // virtio queues
     queues: Vec<Queue>,
@@ -178,7 +185,7 @@ pub struct VirtioPciDevice {
 
 impl VirtioPciDevice {
     /// Constructs a new PCI transport for the given virtio device.
-    pub fn new(memory: GuestMemoryMmap, device: Box<VirtioDevice>) -> Result<Self> {
+    pub fn new(name: String, memory: GuestMemoryMmap, device: Box<VirtioDevice>) -> Result<Self> {
         let mut queue_evts = Vec::new();
         for _ in device.queue_max_sizes().iter() {
             queue_evts.push(EventFd::new(EFD_NONBLOCK)?)
@@ -203,6 +210,8 @@ impl VirtioPciDevice {
         );
 
         Ok(VirtioPciDevice {
+            name,
+            bar_base_addr: 0,
             configuration,
             common_config: VirtioPciCommonConfig {
                 driver_status: 0,
@@ -215,6 +224,7 @@ impl VirtioPciDevice {
             device_activated: false,
             interrupt_status: Arc::new(AtomicUsize::new(0)),
             interrupt_evt: None,
+            irq_num: 0xffff_ffff,
             queues,
             queue_evts,
             memory: Some(memory),
@@ -232,6 +242,10 @@ impl VirtioPciDevice {
     /// Gets the event this device uses to interrupt the VM when the used queue is changed.
     pub fn interrupt_evt(&self) -> Option<&EventFd> {
         self.interrupt_evt.as_ref()
+    }
+
+    pub fn irq_num(&self) -> u32 {
+        self.irq_num
     }
 
     fn is_driver_ready(&self) -> bool {
@@ -310,12 +324,27 @@ impl VirtioPciDevice {
         self.settings_bar = settings_bar;
         Ok(())
     }
+
+    pub fn get_resource(&self) -> Vec<IoResource> {
+        let mut vec = Vec::new();
+        let res = IoResource::new(None, CAPABILITY_BAR_SIZE, IoType::Mmio);
+
+        vec.push(res);
+
+        // Allocate the device specific BARs.
+        for config in self.device.get_device_bars() {
+            vec.push(IoResource::new(None, config.get_size(), IoType::Mmio)); 
+        }
+        vec 
+    }
+
 }
 
 impl PciDevice for VirtioPciDevice {
     fn assign_irq(&mut self, irq_evt: EventFd, irq_num: u32, irq_pin: PciInterruptPin) {
         self.configuration.set_irq(irq_num as u8, irq_pin);
         self.interrupt_evt = Some(irq_evt);
+        self.irq_num = irq_num;
     }
 
     fn config_registers(&self) -> &PciConfiguration {
@@ -476,16 +505,6 @@ impl PciDevice for VirtioPciDevice {
             }
         }
     }
-}
-
-impl BusDevice for VirtioPciDevice {
-    fn read(&mut self, offset: u64, data: &mut [u8]) {
-        self.read_bar(offset, data)
-    }
-
-    fn write(&mut self, offset: u64, data: &[u8]) {
-        self.write_bar(offset, data)
-    }
 
     fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
         if offset as usize + data.len() > 4 {
@@ -507,5 +526,71 @@ impl BusDevice for VirtioPciDevice {
 
     fn read_config_register(&self, reg_idx: usize) -> u32 {
         self.config_registers().read_reg(reg_idx)
+    }
+}
+
+impl Device for VirtioPciDevice {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn read(&mut self, addr: GuestAddress, data: &mut [u8], _io_type: IoType) {
+        self.read_bar(addr.0 - self.bar_base_addr, data)
+    }
+
+    fn write(&mut self, addr: GuestAddress, data: &[u8], _io_type: IoType) {
+        self.write_bar(addr.0 - self.bar_base_addr, data)
+    }
+
+    fn set_resources(&mut self, res: &[IoResource], irq: Option<IrqResource>) {
+        // For now, virtio device only designs one BAR.
+        if let Some(r) = res.iter().next() {
+            if let Some(a) = r.addr {
+                let config = PciBarConfiguration::default()
+                    .set_register_index(0)
+                    .set_address(a.0)
+                    .set_size(r.size as u64);
+
+                self.bar_base_addr = a.0;
+        
+                let virtio_pci_bar =
+                    self.configuration.add_pci_bar(&config).map_err(|e| {
+                    PciDeviceError::IoRegistrationFailed(a.0, e)
+                    }).unwrap() as u8;
+
+                // Once the BARs are allocated, the capabilities can be added to the PCI configuration.
+                if let Err(_) = self.add_pci_capabilities(virtio_pci_bar) {
+                    println!("pci capability adding error!");
+                }
+            }
+        } else {
+            // BAR allocated failed.
+            return;
+        }
+
+        for r in res[1..].iter() {
+            // Set the device specific BARs allocated resource back.
+            for config in self.device.get_device_bars() {
+                if let Some(a) = r.addr {
+                    config.set_address(a.0);
+                    let _device_bar = self.configuration.add_pci_bar(&config).map_err(|e| {
+                        PciDeviceError::IoRegistrationFailed(a.0, e)
+                    });
+                } else {
+                    // BAR allocated failed.
+                    return;
+                }
+            }
+        }
+        // IRQ
+        match irq {
+            None => return,
+            Some(IrqResource(irq_num)) => {
+                // Assign IRQ to the virtio-pci device
+                if let Some(irqfd) = EventFd::new(EFD_NONBLOCK).ok() {
+                    self.assign_irq(irqfd, irq_num.unwrap(), PciInterruptPin::IntA);
+                }
+            }
+       }
     }
 }

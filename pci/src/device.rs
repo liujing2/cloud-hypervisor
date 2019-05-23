@@ -2,9 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
+use byteorder::{ByteOrder, LittleEndian};
 use crate::configuration::{self, PciConfiguration};
 use crate::PciInterruptPin;
-use devices::BusDevice;
+use vm_device::device::Device;
 use std;
 use std::fmt::{self, Display};
 use vm_allocator::SystemAllocator;
@@ -38,7 +39,7 @@ impl Display for Error {
     }
 }
 
-pub trait PciDevice: BusDevice {
+pub trait PciDevice: Device {
     /// Assign a legacy PCI IRQ to this device.
     /// The device may write to `irq_evt` to trigger an interrupt.
     fn assign_irq(&mut self, _irq_evt: EventFd, _irq_num: u32, _irq_pin: PciInterruptPin) {}
@@ -76,4 +77,28 @@ pub trait PciDevice: BusDevice {
     fn write_bar(&mut self, addr: u64, data: &[u8]);
     /// Invoked when the device is sandboxed.
     fn on_device_sandboxed(&mut self) {}
+
+    /// Read the configuration register according to register index.
+    fn read_config_register(&self, reg_idx: usize) -> u32 {
+        self.config_registers().read_reg(reg_idx)
+    }
+
+    /// Write the configuration register according to register index and offset.
+    fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
+        if offset as usize + data.len() > 4 {
+            return;
+        }
+
+        let regs = self.config_registers_mut();
+
+        match data.len() {
+            1 => regs.write_byte(reg_idx * 4 + offset as usize, data[0]),
+            2 => regs.write_word(
+                reg_idx * 4 + offset as usize,
+                (data[0] as u16) | (data[1] as u16) << 8,
+            ),
+            4 => regs.write_reg(reg_idx, LittleEndian::read_u32(data)),
+            _ => (),
+        }
+    }
 }

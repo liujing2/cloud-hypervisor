@@ -6,7 +6,6 @@ edition = "2018"
 
 [dependencies]
 byteorder = "=1.2.1"
-devices = { path = "../devices" }
 epoll = "=4.0.1"
 libc = ">=0.2.39"
 log = "*"
@@ -16,6 +15,7 @@ pci = { path = "../pci" }
 tempfile = ">=3.0.2"
 virtio-bindings = { path = "../virtio-bindings" }
 vm-allocator = { path = "../vm-allocator" }
+vm-device = { path = "../vm-device" }
 vmm-sys-util = { git = "https://github.com/liujing2/vmm-sys-util" }
 
 [dependencies.vm-memory]

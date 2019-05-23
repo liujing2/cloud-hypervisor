@@ -10,16 +10,18 @@ extern crate byteorder;
 extern crate epoll;
 extern crate libc;
 
+extern crate vm_device;
 extern crate vm_memory;
 extern crate vmm_sys_util;
+
+pub mod i8042;
+pub mod serial;
 
 use std::fs::File;
 use std::io;
 
-mod bus;
-pub mod legacy;
-
-pub use self::bus::{Bus, BusDevice, Error as BusError};
+pub use self::i8042::I8042Device;
+pub use self::serial::Serial;
 
 pub type DeviceEventT = u16;
 

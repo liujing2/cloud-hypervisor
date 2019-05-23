@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
+use vm_device::device::{Device, IrqResource, IoResource, IoType};
+use vm_memory::{GuestAddress};
 use vmm_sys_util::EventFd;
-
-use BusDevice;
 
 /// A i8042 PS/2 controller that emulates just enough to shutdown the machine.
 pub struct I8042Device {
@@ -21,19 +21,29 @@ impl I8042Device {
 // i8042 device is located at I/O port 0x61. We partially implement two 8-bit
 // registers: port 0x61 (I8042_PORT_B_REG, offset 0 from base of 0x61), and
 // port 0x64 (I8042_COMMAND_REG, offset 3 from base of 0x61).
-impl BusDevice for I8042Device {
-    fn read(&mut self, offset: u64, data: &mut [u8]) {
-        if data.len() == 1 && offset == 3 {
+impl Device for I8042Device {
+    fn name(&self) -> String {
+        "I8042".to_string().clone()
+    }
+
+    fn set_resources(&mut self, _res: &[IoResource], _irq: Option<IrqResource>) {
+    }
+
+    fn read(&mut self, offset: GuestAddress, data: &mut [u8], _io_type: IoType) {
+        let offset = GuestAddress(offset.0 - 0x61);
+        if data.len() == 1 && offset.0 == 3 {
             data[0] = 0x0;
-        } else if data.len() == 1 && offset == 0 {
+        } else if data.len() == 1 && offset.0 == 0 {
             // Like kvmtool, we return bit 5 set in I8042_PORT_B_REG to
             // avoid hang in pit_calibrate_tsc() in Linux kernel.
             data[0] = 0x20;
         }
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) {
-        if data.len() == 1 && data[0] == 0xfe && offset == 3 {
+    fn write(&mut self, offset: GuestAddress, data: &[u8], _io_type: IoType) {
+        let offset = GuestAddress(offset.0 - 0x61);
+
+        if data.len() == 1 && data[0] == 0xfe && offset.0 == 3 {
             if let Err(e) = self.reset_evt.write(1) {
                 println!("Error triggering i8042 reset event: {}", e);
             }

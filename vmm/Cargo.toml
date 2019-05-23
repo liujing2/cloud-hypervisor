@@ -6,7 +6,6 @@ edition = "2018"
 
 [dependencies]
 arch = { path = "../arch" }
-devices = { path = "../devices" }
 epoll = "=4.0.1"
 kvm-bindings = "0.1"
 kvm-ioctls = "0.1.0"
@@ -16,8 +15,10 @@ net_util = { path = "../net_util" }
 pci = {path = "../pci"}
 qcow = { path = "../qcow" }
 linux-loader = { git = "https://github.com/bjzhjing/linux-loader" }
-vm-virtio = { path = "../vm-virtio" }
+legacy-device = { path = "../legacy-device" }
+vm-device = { path = "../vm-device" }
 vm-allocator = { path = "../vm-allocator" }
+vm-virtio = { path = "../vm-virtio" }
 vmm-sys-util = { git = "https://github.com/liujing2/vmm-sys-util" }
 
 [dependencies.vm-memory]

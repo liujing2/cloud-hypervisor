@@ -8,15 +8,13 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
-
 extern crate arch;
-extern crate devices;
 extern crate epoll;
 extern crate kvm_ioctls;
+extern crate legacy_device;
 extern crate libc;
 extern crate linux_loader;
 extern crate net_util;
-extern crate vm_allocator;
 extern crate vm_memory;
 extern crate vm_virtio;
 extern crate vmm_sys_util;
@@ -27,7 +25,7 @@ use libc::{c_void, siginfo_t, EFD_NONBLOCK};
 use linux_loader::cmdline;
 use linux_loader::loader::KernelLoader;
 use net_util::{MacAddr, Tap};
-use pci::{PciConfigIo, PciDevice, PciInterruptPin, PciRoot};
+use pci::{PciConfigIo, PciDevice, PciRoot};
 use qcow::{self, ImageType, QcowFile};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -38,6 +36,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{result, str, thread};
 use vm_allocator::SystemAllocator;
+use vm_device::device::{IoResource, IoType, IrqResource};
+use vm_device::device_manager::DeviceManager;
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestUsize,
     MmapError,
@@ -112,14 +112,11 @@ pub enum Error {
     /// The call to KVM_SET_CPUID2 failed.
     SetSupportedCpusFailed(io::Error),
 
-    /// Cannot create a device manager.
-    DeviceManager(DeviceManagerError),
+    /// Cannot create devices.
+    Devices(DeviceError),
 
     /// Cannot create EventFd.
     EventFd(io::Error),
-
-    /// Cannot add legacy device to Bus.
-    BusError(devices::BusError),
 
     /// Cannot create epoll context.
     EpollError(io::Error),
@@ -149,7 +146,7 @@ pub type Result<T> = result::Result<T, Error>;
 
 /// Errors associated with device manager
 #[derive(Debug)]
-pub enum DeviceManagerError {
+pub enum DeviceError {
     /// Cannot create EventFd.
     EventFd(io::Error),
 
@@ -174,14 +171,8 @@ pub enum DeviceManagerError {
     /// Cannot open tap interface
     OpenTap(net_util::TapError),
 
-    /// Cannot allocate IRQ.
-    AllocateIrq,
-
     /// Cannot configure the IRQ.
     Irq(io::Error),
-
-    /// Cannot allocate PCI BARs
-    AllocateBars(pci::PciDeviceError),
 
     /// Cannot register ioevent.
     RegisterIoevent(io::Error),
@@ -191,15 +182,17 @@ pub enum DeviceManagerError {
 
     /// Cannot add PCI device
     AddPciDevice(pci::PciRootError),
+
+    /// Cannot register device
+    RegisterDevice(vm_device::DeviceManagerError),
 }
-pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
+pub type DeviceResult<T> = result::Result<T, DeviceError>;
 
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     fd: VcpuFd,
     id: u8,
-    io_bus: devices::Bus,
-    mmio_bus: devices::Bus,
+    device_manager: Arc<Mutex<DeviceManager>>,
 }
 
 impl Vcpu {
@@ -209,14 +202,13 @@ impl Vcpu {
     ///
     /// * `id` - Represents the CPU number between [0, max vcpus).
     /// * `vm` - The virtual machine this vcpu will get attached to.
-    pub fn new(id: u8, vm: &Vm, io_bus: devices::Bus, mmio_bus: devices::Bus) -> Result<Self> {
+    pub fn new(id: u8, vm: &Vm, device_manager: Arc<Mutex<DeviceManager>>) -> Result<Self> {
         let kvm_vcpu = vm.fd.create_vcpu(id).map_err(Error::VcpuFd)?;
         // Initially the cpuid per vCPU is the one supported by this VM.
         Ok(Vcpu {
             fd: kvm_vcpu,
             id,
-            io_bus,
-            mmio_bus,
+            device_manager,
         })
     }
 
@@ -252,23 +244,37 @@ impl Vcpu {
     ///
     /// Note that the state of the VCPU and associated VM must be setup first for this to do
     /// anything useful.
+    // For now, only bypass the error case of DeviceManager handling.
+    #[allow(unused)]
     pub fn run(&self) -> Result<()> {
         match self.fd.run() {
             Ok(run) => match run {
                 VcpuExit::IoIn(addr, data) => {
-                    self.io_bus.read(u64::from(addr), data);
+                    self.device_manager
+                        .lock()
+                        .expect("failed to acquire lock")
+                        .read(GuestAddress(u64::from(addr)), data, IoType::Pio);
                     Ok(())
                 }
                 VcpuExit::IoOut(addr, data) => {
-                    self.io_bus.write(u64::from(addr), data);
+                    self.device_manager
+                        .lock()
+                        .expect("failed to acquire lock")
+                        .write(GuestAddress(u64::from(addr)), data, IoType::Pio);
                     Ok(())
                 }
                 VcpuExit::MmioRead(addr, data) => {
-                    self.mmio_bus.read(addr as u64, data);
+                    self.device_manager
+                        .lock()
+                        .expect("failed to acquire lock")
+                        .read(GuestAddress(u64::from(addr)), data, IoType::Mmio);
                     Ok(())
                 }
                 VcpuExit::MmioWrite(addr, data) => {
-                    self.mmio_bus.write(addr as u64, data);
+                    self.device_manager
+                        .lock()
+                        .expect("failed to acquire lock")
+                        .write(GuestAddress(u64::from(addr)), data, IoType::Mmio);
                     Ok(())
                 }
                 r => {
@@ -380,45 +386,83 @@ fn parse_net_params(net_params: &str) -> Result<NetParams> {
     })
 }
 
-struct DeviceManager {
-    io_bus: devices::Bus,
-    mmio_bus: devices::Bus,
+// legacy device instances
+struct Devices {
+    // Serial port on 0x3f8 clone here
+    serial: Arc<Mutex<legacy_device::Serial>>,
 
     // Serial port on 0x3f8
-    serial: Arc<Mutex<devices::legacy::Serial>>,
     serial_evt: EventFd,
 
     // i8042 device for exit
-    i8042: Arc<Mutex<devices::legacy::I8042Device>>,
-    exit_evt: EventFd,
+    i8042: Arc<Mutex<legacy_device::I8042Device>>,
 
-    // PCI root
-    pci: Arc<Mutex<PciConfigIo>>,
+    // i8042 device for exit
+    exit_evt: EventFd,
 }
 
-impl DeviceManager {
-    fn new(
-        memory: GuestMemoryMmap,
-        allocator: &mut SystemAllocator,
-        vm_fd: &VmFd,
-        vm_cfg: &VmConfig,
-    ) -> DeviceManagerResult<Self> {
-        let io_bus = devices::Bus::new();
-        let mut mmio_bus = devices::Bus::new();
-        let serial_evt = EventFd::new(EFD_NONBLOCK).map_err(DeviceManagerError::EventFd)?;
-        let serial = Arc::new(Mutex::new(devices::legacy::Serial::new_out(
-            serial_evt
-                .try_clone()
-                .map_err(DeviceManagerError::EventFd)?,
+impl Devices {
+    fn new() -> DeviceResult<Self> {
+        let serial_evt = EventFd::new(EFD_NONBLOCK).map_err(DeviceError::EventFd)?;
+        let serial = Arc::new(Mutex::new(legacy_device::Serial::new_out(
+            serial_evt.try_clone().map_err(DeviceError::EventFd)?,
             Box::new(stdout()),
         )));
 
-        let exit_evt = EventFd::new(EFD_NONBLOCK).map_err(DeviceManagerError::EventFd)?;
-        let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
-            exit_evt.try_clone().map_err(DeviceManagerError::EventFd)?,
+        let exit_evt = EventFd::new(EFD_NONBLOCK).map_err(DeviceError::EventFd)?;
+        let i8042 = Arc::new(Mutex::new(legacy_device::I8042Device::new(
+            exit_evt.try_clone().map_err(DeviceError::EventFd)?,
         )));
 
-        let mut pci_root = PciRoot::new(None);
+        Ok(Devices {
+            serial,
+            serial_evt,
+            i8042,
+            exit_evt,
+        })
+    }
+
+    fn register_devices(
+        &mut self,
+        memory: GuestMemoryMmap,
+        vm_fd: &VmFd,
+        vm_cfg: &VmConfig,
+        device_manager: &mut DeviceManager,
+    ) -> DeviceResult<()> {
+        // Register serial device
+        let mut resource = Vec::new();
+        resource.push(IoResource::new(
+            Some(GuestAddress(0x3f8)),
+            8 as GuestUsize,
+            IoType::Pio,
+        ));
+        device_manager
+            .register_device(
+                self.serial.clone(),
+                None,
+                &mut resource,
+                Some(IrqResource(None)),
+            )
+            .map_err(DeviceError::RegisterDevice)?;
+
+        // Register i8042
+        let mut resource = Vec::new();
+        resource.push(IoResource::new(
+            Some(GuestAddress(0x61)),
+            4 as GuestUsize,
+            IoType::Pio,
+        ));
+        device_manager
+            .register_device(
+                self.i8042.clone(),
+                None,
+                &mut resource,
+                Some(IrqResource(None)),
+            )
+            .map_err(DeviceError::RegisterDevice)?;
+
+        let pci_root = PciRoot::new(None);
+        let mut pci = Arc::new(Mutex::new(PciConfigIo::new(pci_root)));
 
         for disk_path in &vm_cfg.disk_paths {
             // Open block device path
@@ -426,34 +470,33 @@ impl DeviceManager {
                 .read(true)
                 .write(true)
                 .open(disk_path.as_path())
-                .map_err(DeviceManagerError::Disk)?;
+                .map_err(DeviceError::Disk)?;
 
             // Add virtio-blk
             let image_type =
-                qcow::detect_image_type(&raw_img).map_err(DeviceManagerError::DetectImageType)?;
+                qcow::detect_image_type(&raw_img).map_err(DeviceError::DetectImageType)?;
             let block = match image_type {
                 ImageType::Raw => {
                     let raw_img = vm_virtio::RawFile::new(raw_img);
                     let dev = vm_virtio::Block::new(raw_img, disk_path.to_path_buf(), false)
-                        .map_err(DeviceManagerError::CreateVirtioBlock)?;
+                        .map_err(DeviceError::CreateVirtioBlock)?;
                     Box::new(dev) as Box<vm_virtio::VirtioDevice>
                 }
                 ImageType::Qcow2 => {
                     let qcow_img =
-                        QcowFile::from(raw_img).map_err(DeviceManagerError::QcowDeviceCreate)?;
+                        QcowFile::from(raw_img).map_err(DeviceError::QcowDeviceCreate)?;
                     let dev = vm_virtio::Block::new(qcow_img, disk_path.to_path_buf(), false)
-                        .map_err(DeviceManagerError::CreateVirtioBlock)?;
+                        .map_err(DeviceError::CreateVirtioBlock)?;
                     Box::new(dev) as Box<vm_virtio::VirtioDevice>
                 }
             };
-
-            DeviceManager::add_virtio_pci_device(
+            Devices::add_virtio_pci_device(
+                "virtio-block".to_string(),
                 block,
                 memory.clone(),
-                allocator,
                 vm_fd,
-                &mut pci_root,
-                &mut mmio_bus,
+                &mut pci,
+                device_manager,
             )?;
         }
 
@@ -463,114 +506,108 @@ impl DeviceManager {
                 let mut virtio_net_device: vm_virtio::Net;
 
                 if let Some(tap_if_name) = net_params.tap_if_name {
-                    let tap = Tap::open_named(tap_if_name).map_err(DeviceManagerError::OpenTap)?;
+                    let tap = Tap::open_named(tap_if_name).map_err(DeviceError::OpenTap)?;
                     virtio_net_device =
                         vm_virtio::Net::new_with_tap(tap, Some(&net_params.mac_addr))
-                            .map_err(DeviceManagerError::CreateVirtioNet)?;
+                            .map_err(DeviceError::CreateVirtioNet)?;
                 } else {
                     virtio_net_device = vm_virtio::Net::new(
                         net_params.ip_addr,
                         net_params.net_mask,
                         Some(&net_params.mac_addr),
                     )
-                    .map_err(DeviceManagerError::CreateVirtioNet)?;
+                    .map_err(DeviceError::CreateVirtioNet)?;
                 }
-
-                DeviceManager::add_virtio_pci_device(
+                Devices::add_virtio_pci_device(
+                    "virtio-net".to_string(),
                     Box::new(virtio_net_device),
                     memory.clone(),
-                    allocator,
                     vm_fd,
-                    &mut pci_root,
-                    &mut mmio_bus,
+                    &mut pci,
+                    device_manager,
                 )?;
             }
         }
 
         // Add virtio-rng if required
         if let Some(rng_path) = &vm_cfg.rng_path {
+            println!("VIRTIO_RNG PATH {}", rng_path);
             let virtio_rng_device =
-                vm_virtio::Rng::new(rng_path).map_err(DeviceManagerError::CreateVirtioRng)?;
-
-            DeviceManager::add_virtio_pci_device(
+                vm_virtio::Rng::new(rng_path).map_err(DeviceError::CreateVirtioRng)?;
+            Devices::add_virtio_pci_device(
+                "virtio-rng".to_string(),
                 Box::new(virtio_rng_device),
                 memory.clone(),
-                allocator,
                 vm_fd,
-                &mut pci_root,
-                &mut mmio_bus,
+                &mut pci,
+                device_manager,
             )?;
         }
 
-        let pci = Arc::new(Mutex::new(PciConfigIo::new(pci_root)));
+        let res = IoResource::new(Some(GuestAddress(0xcf8)), 8, IoType::Pio);
+        println!("register device 0xcf8");
+        let mut res_req = Vec::new();
+        res_req.push(res);
 
-        Ok(DeviceManager {
-            io_bus,
-            mmio_bus,
-            serial,
-            serial_evt,
-            i8042,
-            exit_evt,
-            pci,
-        })
-    }
-
-    fn add_virtio_pci_device(
-        virtio_device: Box<vm_virtio::VirtioDevice>,
-        memory: GuestMemoryMmap,
-        allocator: &mut SystemAllocator,
-        vm_fd: &VmFd,
-        pci_root: &mut PciRoot,
-        mmio_bus: &mut devices::Bus,
-    ) -> DeviceManagerResult<()> {
-        let mut virtio_pci_device = VirtioPciDevice::new(memory, virtio_device)
-            .map_err(DeviceManagerError::VirtioDevice)?;
-        let bars = virtio_pci_device
-            .allocate_bars(allocator)
-            .map_err(DeviceManagerError::AllocateBars)?;
-
-        for (event, addr, _) in virtio_pci_device.ioeventfds() {
-            let io_addr = IoEventAddress::Mmio(addr);
-            vm_fd
-                .register_ioevent(event.as_raw_fd(), &io_addr, NoDatamatch)
-                .map_err(DeviceManagerError::RegisterIoevent)?;
-        }
-
-        // Assign IRQ to the virtio-pci device
-        let irqfd = EventFd::new(EFD_NONBLOCK).map_err(DeviceManagerError::EventFd)?;
-        let irq_num = allocator
-            .allocate_irq()
-            .ok_or(DeviceManagerError::AllocateIrq)?;
-        vm_fd
-            .register_irqfd(irqfd.as_raw_fd(), irq_num)
-            .map_err(DeviceManagerError::Irq)?;
-        // Let's use irq line INTA for now.
-        virtio_pci_device.assign_irq(irqfd, irq_num as u32, PciInterruptPin::IntA);
-
-        let virtio_pci_device = Arc::new(Mutex::new(virtio_pci_device));
-
-        pci_root
-            .add_device(virtio_pci_device.clone(), mmio_bus, bars)
-            .map_err(DeviceManagerError::AddPciDevice)?;
-
+        device_manager
+            .register_device(pci.clone(), None, &mut res_req, None)
+            .map_err(DeviceError::RegisterDevice)?;
         Ok(())
     }
 
-    pub fn register_devices(&mut self) -> Result<()> {
-        // Insert serial device
-        self.io_bus
-            .insert(self.serial.clone(), 0x3f8, 0x8)
-            .map_err(Error::BusError)?;
+    fn add_virtio_pci_device(
+        name: String,
+        virtio_device: Box<vm_virtio::VirtioDevice>,
+        memory: GuestMemoryMmap,
+        vm_fd: &VmFd,
+        pci: &mut Arc<Mutex<PciConfigIo>>,
+        device_manager: &mut DeviceManager,
+    ) -> DeviceResult<()> {
+        let virtio_pci_device = VirtioPciDevice::new(name.clone(), memory, virtio_device)
+            .map_err(DeviceError::VirtioDevice)?;
 
-        // Insert i8042 device
-        self.io_bus
-            .insert(self.i8042.clone(), 0x61, 0x4)
-            .map_err(Error::BusError)?;
+        // Register virtio device resource
+        let mut resource = virtio_pci_device.get_resource();
 
-        // Insert the PCI root configuration space.
-        self.io_bus
-            .insert(self.pci.clone(), 0xcf8, 0x8)
-            .map_err(Error::BusError)?;
+        let virtio_pci_device = Arc::new(Mutex::new(virtio_pci_device));
+
+        device_manager
+            .register_device(
+                virtio_pci_device.clone(),
+                Some(pci.clone()),
+                &mut resource,
+                Some(IrqResource(None)),
+            )
+            .map_err(DeviceError::RegisterDevice)?;
+
+        pci.lock()
+            .expect("failed to acquire lock")
+            .add_device(virtio_pci_device.clone())
+            .map_err(DeviceError::AddPciDevice)?;
+
+        for (event, addr, _) in virtio_pci_device
+            .lock()
+            .expect("failed to unlock")
+            .ioeventfds()
+        {
+            let io_addr = IoEventAddress::Mmio(addr);
+            vm_fd
+                .register_ioevent(event.as_raw_fd(), &io_addr, NoDatamatch)
+                .map_err(DeviceError::RegisterIoevent)?;
+        }
+
+        let irq_num = virtio_pci_device.lock().expect("failed").irq_num();
+        let event_fd = virtio_pci_device
+            .lock()
+            .expect("failed")
+            .interrupt_evt()
+            .unwrap()
+            .as_raw_fd();
+
+        vm_fd
+            .register_irqfd(event_fd, irq_num)
+            .map_err(DeviceError::Irq)?;
+
         Ok(())
     }
 }
@@ -644,7 +681,8 @@ pub struct Vm<'a> {
     kernel: File,
     memory: GuestMemoryMmap,
     vcpus: Vec<thread::JoinHandle<()>>,
-    devices: DeviceManager,
+    legacy: Devices,
+    device_manager: Arc<Mutex<DeviceManager>>,
     cpuid: CpuId,
     config: VmConfig<'a>,
     epoll: EpollContext,
@@ -695,18 +733,27 @@ impl<'a> Vm<'a> {
         Vm::patch_cpuid(&mut cpuid);
 
         // Let's allocate 64 GiB of addressable MMIO space, starting at 0.
-        let mut allocator = SystemAllocator::new(
-            None,
-            None,
+        let allocator = SystemAllocator::new(
+            Some(GuestAddress(0)),
+            Some(1 << 16 as GuestUsize),
             GuestAddress(0),
             1 << 36 as GuestUsize,
             X86_64_IRQ_BASE,
         )
         .ok_or(Error::CreateSystemAllocator)?;
 
-        let device_manager = DeviceManager::new(guest_memory.clone(), &mut allocator, &fd, &config)
-            .map_err(Error::DeviceManager)?;
-        fd.register_irqfd(device_manager.serial_evt.as_raw_fd(), 4)
+        let mut device_manager = DeviceManager::new(Arc::new(Mutex::new(allocator)));
+
+        // Create devices
+        let mut devices = Devices::new().map_err(Error::Devices)?;
+
+        devices
+            .register_devices(guest_memory.clone(), &fd, &config, &mut device_manager)
+            .map_err(Error::Devices)?;
+
+        let dev_mgr = Arc::new(Mutex::new(device_manager));
+
+        fd.register_irqfd(devices.serial_evt.as_raw_fd(), 4)
             .map_err(Error::Irq)?;
 
         // Let's add our STDIN fd.
@@ -715,7 +762,7 @@ impl<'a> Vm<'a> {
 
         // Let's add an exit event.
         epoll
-            .add_event(&device_manager.exit_evt, EpollDispatch::Exit)
+            .add_event(&devices.exit_evt, EpollDispatch::Exit)
             .map_err(Error::EpollError)?;
 
         let vcpus = Vec::with_capacity(config.vcpu_count as usize);
@@ -725,7 +772,8 @@ impl<'a> Vm<'a> {
             kernel,
             memory: guest_memory,
             vcpus,
-            devices: device_manager,
+            legacy: devices,
+            device_manager: dev_mgr,
             cpuid,
             config,
             epoll,
@@ -785,7 +833,7 @@ impl<'a> Vm<'a> {
                     match dispatch_type {
                         EpollDispatch::Exit => {
                             // Consume the event.
-                            self.devices.exit_evt.read().map_err(Error::EventFd)?;
+                            self.legacy.exit_evt.read().map_err(Error::EventFd)?;
 
                             // Don't forget to set the terminal in canonical mode
                             // before to exit.
@@ -802,7 +850,7 @@ impl<'a> Vm<'a> {
                             let mut out = [0u8; 64];
                             let count = stdin_lock.read_raw(&mut out).map_err(Error::Serial)?;
 
-                            self.devices
+                            self.legacy
                                 .serial
                                 .lock()
                                 .expect("Failed to process stdin event due to poisoned lock")
@@ -816,17 +864,13 @@ impl<'a> Vm<'a> {
     }
 
     pub fn start(&mut self, entry_addr: GuestAddress) -> Result<()> {
-        self.devices.register_devices()?;
-
         let vcpu_count = self.config.vcpu_count;
 
         //        let vcpus: Vec<thread::JoinHandle<()>> = Vec::with_capacity(vcpu_count as usize);
         let vcpu_thread_barrier = Arc::new(Barrier::new((vcpu_count + 1) as usize));
 
         for cpu_id in 0..vcpu_count {
-            let io_bus = self.devices.io_bus.clone();
-            let mmio_bus = self.devices.mmio_bus.clone();
-            let mut vcpu = Vcpu::new(cpu_id, &self, io_bus, mmio_bus)?;
+            let mut vcpu = Vcpu::new(cpu_id, &self, self.device_manager.clone())?;
             vcpu.configure(entry_addr, &self)?;
 
             let vcpu_thread_barrier = vcpu_thread_barrier.clone();
