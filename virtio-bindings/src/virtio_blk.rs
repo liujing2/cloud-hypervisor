@@ -39,6 +39,7 @@ pub const VIRTIO_BLK_F_SCSI: u32 = 7;
 pub const VIRTIO_BLK_F_FLUSH: u32 = 9;
 pub const VIRTIO_BLK_F_CONFIG_WCE: u32 = 11;
 pub const VIRTIO_BLK_F_WCE: u32 = 9;
+pub const VIRTIO_BLK_F_VIS: u32 = 24;
 pub const VIRTIO_BLK_ID_BYTES: u32 = 20;
 pub const VIRTIO_BLK_T_IN: u32 = 0;
 pub const VIRTIO_BLK_T_OUT: u32 = 1;

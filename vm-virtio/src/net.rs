@@ -460,6 +460,7 @@ impl Net {
             | 1 << VIRTIO_NET_F_GUEST_UFO
             | 1 << VIRTIO_NET_F_HOST_TSO4
             | 1 << VIRTIO_NET_F_HOST_UFO
+            | 1 << VIRTIO_NET_F_VIS
             | 1 << VIRTIO_F_VERSION_1;
 
         let mut config_space;

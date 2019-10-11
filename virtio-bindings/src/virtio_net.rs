@@ -173,6 +173,7 @@ pub const VIRTIO_NET_F_CTRL_RX_EXTRA: u32 = 20;
 pub const VIRTIO_NET_F_GUEST_ANNOUNCE: u32 = 21;
 pub const VIRTIO_NET_F_MQ: u32 = 22;
 pub const VIRTIO_NET_F_CTRL_MAC_ADDR: u32 = 23;
+pub const VIRTIO_NET_F_VIS: u32 = 24;
 pub const VIRTIO_NET_F_GSO: u32 = 6;
 pub const VIRTIO_NET_S_LINK_UP: u32 = 1;
 pub const VIRTIO_NET_S_ANNOUNCE: u32 = 2;

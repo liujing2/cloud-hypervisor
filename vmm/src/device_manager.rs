@@ -33,12 +33,15 @@ use std::os::unix::io::AsRawFd;
 use std::ptr::null_mut;
 use std::result;
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::AtomicPtr;
 #[cfg(feature = "pci_support")]
 use vfio::{VfioDevice, VfioPciDevice, VfioPciError};
 use vm_allocator::SystemAllocator;
 #[cfg(feature = "mmio_support")]
 use vm_memory::GuestAddress;
 use vm_memory::{Address, GuestMemoryMmap, GuestUsize};
+#[cfg(feature = "mmio_support")]
+use vm_virtio::transport::{VisTable, VisMbaRegister, VisPbaRegister, VisInterruptDelivery, VisInterruptParameters};
 #[cfg(feature = "pci_support")]
 use vm_virtio::transport::VirtioPciDevice;
 use vm_virtio::{VirtioSharedMemory, VirtioSharedMemoryList};
@@ -48,8 +51,17 @@ use vmm_sys_util::eventfd::EventFd;
 const IOAPIC_RANGE_ADDR: u64 = 0xfec0_0000;
 const IOAPIC_RANGE_SIZE: u64 = 0x20;
 
+// Reserve some 4K holes for VIS
 #[cfg(feature = "mmio_support")]
 const MMIO_LEN: u64 = 0x1000;
+#[cfg(feature = "mmio_support")]
+const MMIO_VET_LEN: u64 = 0x1000;
+#[cfg(feature = "mmio_support")]
+const MMIO_MBA_LEN: u64 = 0x1000;
+#[cfg(feature = "mmio_support")]
+const MMIO_PBA_LEN: u64 = 0x1000;
+#[cfg(feature = "mmio_support")]
+const MMIO_TOTAL_LEN: u64 = 0x4000;
 
 /// Errors associated with device manager
 #[derive(Debug)]
@@ -130,6 +142,9 @@ pub enum DeviceManagerError {
 
     /// Cannot find a memory range for virtio-fs
     FsRangeAllocation,
+
+    /// Cannot find a memory range for vis
+    VisAllocation,
 
     /// Error creating serial output file
     SerialOutputFileOpen(io::Error),
@@ -452,8 +467,9 @@ impl DeviceManager {
             {
                 for device in virtio_devices {
                     if let Some(addr) =
-                        allocator.allocate_mmio_addresses(None, MMIO_LEN, Some(MMIO_LEN))
+                        allocator.allocate_mmio_addresses(None, MMIO_LEN, Some(MMIO_TOTAL_LEN))
                     {
+			// See if ram_regions has registered 3G~4G (guess no)
                         DeviceManager::add_virtio_mmio_device(
                             device,
                             vm_info.memory,
@@ -463,6 +479,8 @@ impl DeviceManager {
                             &interrupt_info,
                             addr,
                             &mut cmdline_additions,
+                            &mut mem_slots,
+                            &mut mmap_regions,
                         )?;
                     } else {
                         error!("Unable to allocate MMIO address!");
@@ -479,6 +497,137 @@ impl DeviceManager {
             mmap_regions,
             cmdline_additions,
         })
+    }
+
+    #[cfg(feature = "mmio_support")]
+    fn mmio_create_vis_regions(
+        mmio_device: &mut vm_virtio::transport::MmioDevice,
+        mmio_base: GuestAddress,
+        allocator: &mut SystemAllocator,
+        vm_fd: &Arc<VmFd>,
+        mem_slots: &mut u32,
+        mmap_regions: &mut Vec<(*mut libc::c_void, usize)>,
+    ) -> DeviceManagerResult<()> {
+        // allocator is from high address, so do pba first
+        // Add PBA table 
+        let vis_pba_guest_addr = allocator
+            .allocate_mmio_addresses(
+                None,
+                MMIO_PBA_LEN as GuestUsize,
+                Some(0x0000_1000),
+            )
+            .ok_or(DeviceManagerError::VisAllocation)?;
+        // Add MBA table 
+        let vis_mba_guest_addr = allocator
+            .allocate_mmio_addresses(
+                None,
+                MMIO_MBA_LEN as GuestUsize,
+                Some(0x0000_1000),
+            )
+            .ok_or(DeviceManagerError::VisAllocation)?;
+        // Add VET table 
+        let vis_vet_guest_addr = allocator
+            .allocate_mmio_addresses(
+                None,
+                MMIO_VET_LEN as GuestUsize,
+                Some(0x0000_1000),
+            )
+            .ok_or(DeviceManagerError::VisAllocation)?;
+
+        let vet_addr = unsafe {
+             libc::mmap(
+                 null_mut(),
+                 MMIO_VET_LEN as usize,
+                 libc::PROT_READ | libc::PROT_WRITE,
+                 libc::MAP_NORESERVE | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                 -1,
+                 0 as libc::off_t,
+            )
+        };
+        if vet_addr == libc::MAP_FAILED {
+            return Err(DeviceManagerError::Mmap(io::Error::last_os_error()));
+        }
+
+        let mba_addr = unsafe {
+             libc::mmap(
+                 null_mut(),
+                 MMIO_MBA_LEN as usize,
+                 libc::PROT_READ | libc::PROT_WRITE,
+                 libc::MAP_NORESERVE | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                 -1,
+                 0 as libc::off_t,
+            )
+        };
+        if mba_addr == libc::MAP_FAILED {
+            return Err(DeviceManagerError::Mmap(io::Error::last_os_error()));
+        }
+
+        let pba_addr = unsafe {
+             libc::mmap(
+                 null_mut(),
+                 MMIO_PBA_LEN as usize,
+                 libc::PROT_READ | libc::PROT_WRITE,
+                 libc::MAP_NORESERVE | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                 -1,
+                 0 as libc::off_t,
+            )
+        };
+        if pba_addr == libc::MAP_FAILED {
+            return Err(DeviceManagerError::Mmap(io::Error::last_os_error()));
+        }
+
+        // vet_addr needs to be casted as struct VetTable pointer
+        let vet = vet_addr as *mut VisTable;
+        let mba = mba_addr as *mut VisMbaRegister;
+        let pba = pba_addr as *mut VisPbaRegister;
+
+        mmio_device.set_vis_addr(AtomicPtr::new(vet),AtomicPtr::new(mba), AtomicPtr::new(pba));
+
+        mmio_device.set_vis_guest_offset(
+            vis_vet_guest_addr.checked_sub(mmio_base.raw_value()),
+            vis_mba_guest_addr.checked_sub(mmio_base.raw_value()),
+            vis_pba_guest_addr.checked_sub(mmio_base.raw_value()),
+        );
+        mmap_regions.push((vet_addr, MMIO_VET_LEN as usize));
+        mmap_regions.push((mba_addr, MMIO_MBA_LEN as usize));
+        mmap_regions.push((pba_addr, MMIO_PBA_LEN as usize));
+
+        // inform KVM
+        let mem_region_vet = kvm_userspace_memory_region {
+                            slot: *mem_slots as u32,
+                            guest_phys_addr: vis_vet_guest_addr.raw_value(),
+                            memory_size: MMIO_VET_LEN,
+                            userspace_addr: vet_addr as u64,
+                            flags: 0,
+        };
+        // Increment the KVM slot number
+        *mem_slots += 1;
+        let mem_region_mba = kvm_userspace_memory_region {
+                            slot: *mem_slots as u32,
+                            guest_phys_addr: vis_mba_guest_addr.raw_value(),
+                            memory_size: MMIO_MBA_LEN,
+                            userspace_addr: mba_addr as u64,
+                            flags: 1 << 1,
+        };
+        // Increment the KVM slot number
+        *mem_slots += 1;
+
+        let mem_region_pba = kvm_userspace_memory_region {
+                            slot: *mem_slots as u32,
+                            guest_phys_addr: vis_pba_guest_addr.raw_value(),
+                            memory_size: MMIO_PBA_LEN,
+                            userspace_addr: pba_addr as u64,
+                            // Readonly region: Write would trap into VMM
+                            flags: 1 << 1,
+        };
+        // Increment the KVM slot number
+        *mem_slots += 1;
+
+        // Safe because the guest regions are guaranteed not to overlap.
+        let _ = unsafe { vm_fd.set_user_memory_region(mem_region_vet) };
+        let _ = unsafe { vm_fd.set_user_memory_region(mem_region_mba) };
+        let _ = unsafe { vm_fd.set_user_memory_region(mem_region_pba) };
+	Ok(())
     }
 
     fn make_virtio_devices(
@@ -983,9 +1132,22 @@ impl DeviceManager {
         interrupt_info: &InterruptInfo,
         mmio_base: GuestAddress,
         cmdline_additions: &mut Vec<String>,
+        mut mem_slots: &mut u32,
+        mmap_regions: &mut Vec<(*mut libc::c_void, usize)>,
     ) -> DeviceManagerResult<()> {
-        let mut mmio_device = vm_virtio::transport::MmioDevice::new(memory.clone(), virtio_device)
+        let vis_num = if interrupt_info._msi_capable {
+            (virtio_device.queue_max_sizes().len() + 1) as u16
+        } else {
+            0
+        };
+
+        let mut mmio_device = vm_virtio::transport::MmioDevice::new(memory.clone(), virtio_device, vis_num)
             .map_err(DeviceManagerError::VirtioDevice)?;
+
+        // Add VIS related registers
+        if interrupt_info._msi_capable {
+            DeviceManager::mmio_create_vis_regions(&mut mmio_device, mmio_base, allocator, &vm_fd, &mut mem_slots, mmap_regions)?;
+        }
 
         for (i, queue_evt) in mmio_device.queue_evts().iter().enumerate() {
             let io_addr = IoEventAddress::Mmio(
@@ -1000,28 +1162,61 @@ impl DeviceManager {
             .allocate_irq()
             .ok_or(DeviceManagerError::AllocateIrq)?;
 
-        let interrupt: Box<dyn devices::Interrupt> = if let Some(ioapic) = interrupt_info.ioapic {
-            Box::new(UserIoapicIrq::new(ioapic.clone(), irq_num as usize))
+	if interrupt_info._msi_capable {
+	    let vm_fd_clone = vm_fd.clone();
+
+	    let vis_cb = Arc::new(Box::new(move |p: VisInterruptParameters| {
+                if let Some(entry) = p.vis {
+                    use kvm_bindings::kvm_msi;
+                    let vis_queue = kvm_msi {
+                        address_lo: entry.msg_addr_lo,
+                        address_hi: entry.msg_addr_hi,
+                        data: entry.msg_data,
+                        flags: 0u32,
+                        devid: 0u32,
+                        pad: [0u8; 12],
+                    };
+
+                    return vm_fd_clone.signal_msi(vis_queue).map(|ret| {
+                        if ret > 0 {
+                            debug!("VIS message successfully delivered");
+                        } else if ret == 0 {
+                            warn!("failed to deliver VIS message, blocked by guest");
+                        }
+                    });
+                }
+
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "missing VIS entry",
+                ))
+            }) as VisInterruptDelivery);
+
+            mmio_device.assign_vis(vis_cb);
+
+	} else if let Some(ioapic) = interrupt_info.ioapic {
+            let interrupt: Box<dyn devices::Interrupt> =
+		Box::new(UserIoapicIrq::new(ioapic.clone(), irq_num as usize));
+            mmio_device.assign_interrupt(interrupt);
         } else {
             let irqfd = EventFd::new(EFD_NONBLOCK).map_err(DeviceManagerError::EventFd)?;
-
             vm_fd
                 .register_irqfd(irqfd.as_raw_fd(), irq_num as u32)
                 .map_err(DeviceManagerError::Irq)?;
 
-            Box::new(KernelIoapicIrq::new(irqfd))
-        };
+            let interrupt: Box<dyn devices::Interrupt> = Box::new(KernelIoapicIrq::new(irqfd));
+            mmio_device.assign_interrupt(interrupt);
+        }
 
-        mmio_device.assign_interrupt(interrupt);
 
         buses
             .mmio
-            .insert(Arc::new(Mutex::new(mmio_device)), mmio_base.0, MMIO_LEN)
+            .insert(Arc::new(Mutex::new(mmio_device)), mmio_base.0, MMIO_TOTAL_LEN)
             .map_err(DeviceManagerError::BusError)?;
 
         cmdline_additions.push(format!(
             "virtio_mmio.device={}K@0x{:08x}:{}",
-            MMIO_LEN / 1024,
+            MMIO_TOTAL_LEN / 1024,
             mmio_base.0,
             irq_num
         ));

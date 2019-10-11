@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ptr::null_mut;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use byteorder::{ByteOrder, LittleEndian};
@@ -13,14 +14,26 @@ use crate::{
     DEVICE_DRIVER_OK, DEVICE_FAILED, DEVICE_FEATURES_OK, DEVICE_INIT,
     INTERRUPT_STATUS_CONFIG_CHANGED, INTERRUPT_STATUS_USED_RING,
 };
+// VIS
+use crate::transport::{VisTableEntry, VisTable, VisMbaRegister, VisPbaRegister};
+
 use devices::{BusDevice, Interrupt};
-use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vm_memory::{Address, GuestAddress, GuestMemoryMmap};
 use vmm_sys_util::{errno::Result, eventfd::EventFd};
 
 const VENDOR_ID: u32 = 0;
 
 const MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
 const MMIO_VERSION: u32 = 2;
+
+/* vis interrupt parameter */
+pub struct VisInterruptParameters<'a> {
+    pub vis: Option<&'a VisTableEntry>,
+}
+
+pub type VisInterruptDelivery =
+    Box<dyn Fn(VisInterruptParameters) -> std::result::Result<(), std::io::Error> + Send + Sync>;
+
 
 /// Implements the
 /// [MMIO](http://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html#x1-1090002)
@@ -50,6 +63,25 @@ pub struct MmioDevice {
     queues: Vec<Queue>,
     queue_evts: Vec<EventFd>,
     mem: Option<Arc<RwLock<GuestMemoryMmap>>>,
+
+    vector_count: u16,
+    // VET offset from mmio base
+    vet_off: Option<GuestAddress>,
+    // MBA offset from mmio base
+    mba_off: Option<GuestAddress>,
+    // PBA offset from mmio base
+    pba_off: Option<GuestAddress>,
+
+    // Being set after libc::mmap.
+    // We must keep a mut pointer instead of value,
+    // because value move will change the process virtual address,
+    // and the pointer should be thread Sendable.
+    vet_addr: Arc<AtomicPtr<VisTable>>,
+    mba_addr: Arc<AtomicPtr<VisMbaRegister>>,
+    pba_addr: Arc<AtomicPtr<VisPbaRegister>>,
+
+    // Need when mask bits change
+    interrupt_cb_unmask: Option<Arc<VisInterruptDelivery>>,
 }
 
 impl MmioDevice {
@@ -57,8 +89,10 @@ impl MmioDevice {
     pub fn new(
         mem: Arc<RwLock<GuestMemoryMmap>>,
         device: Box<dyn VirtioDevice>,
+        vis_num: u16,
     ) -> Result<MmioDevice> {
         let mut queue_evts = Vec::new();
+
         for _ in device.queue_max_sizes().iter() {
             queue_evts.push(EventFd::new(EFD_NONBLOCK)?)
         }
@@ -67,6 +101,7 @@ impl MmioDevice {
             .iter()
             .map(|&s| Queue::new(s))
             .collect();
+
         Ok(MmioDevice {
             device,
             device_activated: false,
@@ -80,7 +115,37 @@ impl MmioDevice {
             queues,
             queue_evts,
             mem: Some(mem),
+            vector_count: vis_num,
+            vet_off: None,
+            mba_off: None,
+            pba_off: None,
+            vet_addr: Arc::new(AtomicPtr::new(null_mut())),
+            mba_addr: Arc::new(AtomicPtr::new(null_mut())),
+            pba_addr: Arc::new(AtomicPtr::new(null_mut())),
+            interrupt_cb_unmask: None,
         })
+    }
+
+    pub fn set_vis_addr(
+        &mut self,
+        vet: AtomicPtr<VisTable>,
+        mba: AtomicPtr<VisMbaRegister>,
+        pba: AtomicPtr<VisPbaRegister>,
+    ) {
+        self.vet_addr = Arc::new(vet);
+        self.mba_addr = Arc::new(mba);
+        self.pba_addr = Arc::new(pba);
+    }
+
+    pub fn set_vis_guest_offset(
+        &mut self,
+        vet: Option<GuestAddress>,
+        mba: Option<GuestAddress>,
+        pba: Option<GuestAddress>
+    ) {
+        self.vet_off = vet;
+        self.mba_off = mba;
+        self.pba_off = pba;
     }
 
     /// Gets the list of queue events that must be triggered whenever the VM writes to
@@ -138,6 +203,75 @@ impl MmioDevice {
 
         self.interrupt_cb = Some(cb);
     }
+
+    #[warn(unused_variables)]
+    pub fn assign_vis(&mut self, vis_cb: Arc<VisInterruptDelivery>) {
+            self.interrupt_cb_unmask = Some(vis_cb.clone());
+
+            let vet_addr = self.vet_addr.clone();
+            let mba_addr = self.mba_addr.clone();
+            let pba_addr = self.pba_addr.clone();
+
+            let cb = Arc::new(Box::new(
+                move |int_type: &VirtioInterruptType, queue: Option<&Queue>| {
+                    let vector = match int_type {
+                        VirtioInterruptType::Config => {
+                            0
+                        }
+                        VirtioInterruptType::Queue => {
+                            if let Some(q) = queue {
+                                q.vector
+                            } else {
+                                0
+                            }
+                        }
+                    };
+
+                let addr = vet_addr.load(Ordering::Relaxed);
+                let entries = unsafe { (*addr).table_entries.clone() };
+                let entry = &( entries[vector as usize] );
+
+                    // The Pending Bit Array table is updated to reflect there
+                    // is a pending interrupt for this specific vector.
+                    unsafe {
+                        let pba_addr = pba_addr.load(Ordering::Relaxed);
+                        let mba_addr = mba_addr.load(Ordering::Relaxed);
+                        if (*mba_addr).masked(vector) {
+                            (*pba_addr).set_pba_bit(vector, false);
+                            return Ok(());
+                        }
+                    } //unsafe
+
+                    (vis_cb)(VisInterruptParameters { vis: Some(entry) })
+                },
+            ) as VirtioInterrupt);
+
+            self.interrupt_cb = Some(cb);
+    }
+
+    // Use scenario: Guest unmask a vector
+    // Move out from PbaRegister because we want to keep it simple for memory sharing.
+    pub fn inject_vis_and_clear_pba(&mut self, vector: u16) {
+        unsafe {
+        if let Some(cb) = &self.interrupt_cb_unmask {
+            let vet_addr = self.vet_addr.clone();
+            let vet_addr = vet_addr.load(Ordering::Relaxed);
+            let vis = (*vet_addr).get_vis_table_entry(vector);
+
+            match (cb)(VisInterruptParameters {
+                vis: Some(&vis),
+            }) {
+                Ok(_) => debug!("VIS injected on vector control flip"),
+                Err(e) => error!("failed to inject VIS: {}", e),
+            };
+        }
+
+        // Clear the bit from PBA
+        let pba_addr = self.pba_addr.clone();
+        let pba_addr = pba_addr.load(Ordering::Relaxed);
+        (*pba_addr).set_pba_bit(vector as u16, true);
+        } // unsafe
+    }
 }
 
 impl BusDevice for MmioDevice {
@@ -157,6 +291,13 @@ impl BusDevice for MmioDevice {
                     0x44 => self.with_queue(0, |q| q.ready as u32),
                     0x60 => self.interrupt_status.load(Ordering::SeqCst) as u32,
                     0x70 => self.driver_status,
+                    // VIS queue vector
+                    0xa8 => self.with_queue(0, |q| q.vector as u32),
+                    // VIS
+                    0xb0 => self.vector_count as u32,
+                    0xb4 => self.vet_off.unwrap().raw_value() as u32,
+                    0xc0 => self.mba_off.unwrap().raw_value() as u32,
+                    0xc4 => self.pba_off.unwrap().raw_value() as u32,
                     0xfc => self.config_generation,
                     _ => {
                         warn!("unknown virtio mmio register read: 0x{:x}", offset);
@@ -166,6 +307,30 @@ impl BusDevice for MmioDevice {
                 LittleEndian::write_u32(data, v);
             }
             0x100..=0xfff => self.device.read_config(offset - 0x100, data),
+            0x1000..=0x1fff => {
+                unsafe {
+                // VET table
+                let vet_addr = self.vet_addr.clone();
+                let vet_addr = vet_addr.load(Ordering::Relaxed);
+                (*vet_addr).read_table(offset - 0x1000, data);
+                } // unsafe
+            }
+            0x2000..=0x2fff => {
+                unsafe {
+                // MBA table
+                let mba_addr = self.mba_addr.clone();
+                let mba_addr = mba_addr.load(Ordering::Relaxed);
+                (*mba_addr).read_mba(offset - 0x2000, data);
+                } // unsafe
+            }
+            0x3000..=0x3fff => {
+                unsafe {
+                // PBA table
+                let pba_addr = self.pba_addr.clone();
+                let pba_addr = pba_addr.load(Ordering::Relaxed);
+                (*pba_addr).read_pba(offset - 0x3000, data);
+                } // unsafe
+            }
             _ => {
                 warn!(
                     "invalid virtio mmio read: 0x{:x}:0x{:x}",
@@ -207,6 +372,8 @@ impl BusDevice for MmioDevice {
                     0x94 => mut_q = self.with_queue_mut(|q| hi(&mut q.avail_ring, v)),
                     0xa0 => mut_q = self.with_queue_mut(|q| lo(&mut q.used_ring, v)),
                     0xa4 => mut_q = self.with_queue_mut(|q| hi(&mut q.used_ring, v)),
+                    // VIS queue vector
+                    0xa8 => mut_q = self.with_queue_mut(|q| q.vector = LittleEndian::read_u16(data)),
                     _ => {
                         warn!("unknown virtio mmio register write: 0x{:x}", offset);
                         return;
@@ -214,6 +381,34 @@ impl BusDevice for MmioDevice {
                 }
             }
             0x100..=0xfff => return self.device.write_config(offset - 0x100, data),
+            0x1000..=0x1fff => {
+                unsafe {
+                // VET table
+                let vet_addr = self.vet_addr.clone();
+                let vet_addr = vet_addr.load(Ordering::Relaxed);
+                (*vet_addr).write_table(offset - 0x1000, data);
+                } // unsafe
+            }
+            0x2000..=0x2fff => {
+                unsafe {
+                // MBA table
+                let mba_addr = self.mba_addr.clone();
+                let mba_addr = mba_addr.load(Ordering::Relaxed);
+                let (need_irq, vector) = (*mba_addr).write_mba(offset - 0x2000, data, self.pba_addr.clone().load(Ordering::Relaxed));
+                if need_irq {
+                   // inject and clear pba 
+                   self.inject_vis_and_clear_pba(vector);
+                }
+                } // unsafe
+            }
+            0x3000..=0x3fff => {
+                unsafe {
+                // PBA table
+                let pba_addr = self.pba_addr.clone();
+                let pba_addr = pba_addr.load(Ordering::Relaxed);
+                (*pba_addr).write_pba(offset - 0x3000, data);
+                } // unsafe
+            }
             _ => {
                 warn!(
                     "invalid virtio mmio write: 0x{:x}:0x{:x}",
